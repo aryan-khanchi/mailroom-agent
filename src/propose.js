@@ -5,6 +5,9 @@ const { validateProposeRequest } = require('./schema');
 const { decideBatch } = require('./model');
 const { buildAndValidateProposal, fallbackProposal } = require('./actions');
 const { errorBody, PROFILE } = require('./util');
+const { makeLogger } = require('./logger');
+
+const log = makeLogger('propose');
 
 function dossierFingerprint(dossier) {
   return sha256Hex(canonicalStringify(dossier));
@@ -19,26 +22,34 @@ function callIdFor(dossierId, fingerprint) {
   return `call-${h}`;
 }
 
-async function handlePropose(body) {
+async function handlePropose(body, reqId) {
   const check = validateProposeRequest(body);
   if (!check.ok) {
+    log.warn(reqId, { evaluationId: body && body.evaluationId, httpStatus: check.status }, `validation failed: ${check.message}`);
     return { httpStatus: check.status, body: errorBody(body, check.message) };
   }
 
   const { evaluationId, dossiers, allowedActions, receiptVerifier } = body;
   const dossiersDigest = digestOf(dossiers);
+  log.info(reqId, { evaluationId, dossierCount: dossiers.length, inputDigest: dossiersDigest }, 'validated');
 
   const existingEval = await db.getEvaluation(evaluationId);
   if (existingEval) {
     if (existingEval.input_digest === dossiersDigest) {
-      // Exact replay: return the stored response verbatim, no model work.
+      log.info(reqId, { evaluationId }, 'EXACT_REPLAY -> 200 (no model work)');
       return { httpStatus: 200, body: JSON.parse(existingEval.response_json) };
     }
+    log.warn(
+      reqId,
+      { evaluationId, storedDigest: existingEval.input_digest, incomingDigest: dossiersDigest },
+      'CONFLICT: evaluationId reused with different content -> 409'
+    );
     return {
       httpStatus: 409,
       body: errorBody(body, 'evaluationId already used with different dossier content'),
     };
   }
+  log.info(reqId, { evaluationId }, 'no existing evaluation found -> treating as new');
 
   // --- Look up per-dossier cache by canonical content fingerprint ---
   // Fingerprints are computed locally, then looked up in ONE batched query
@@ -67,9 +78,12 @@ async function handlePropose(body) {
       uncached.push(d);
     }
   }
+  log.info(reqId, { evaluationId, cached: dossiers.length - uncached.length, uncached: uncached.length }, 'cache lookup done');
 
   if (uncached.length > 0) {
-    const decisions = await decideBatch(uncached, allowedActions);
+    const modelStart = Date.now();
+    const decisions = await decideBatch(uncached, allowedActions, reqId);
+    log.info(reqId, { evaluationId, uncached: uncached.length, decided: decisions.size, durationMs: Date.now() - modelStart }, 'model batch(es) done');
 
     const rowsToInsert = [];
     for (const d of uncached) {
@@ -81,7 +95,7 @@ async function handlePropose(body) {
       try {
         finalProposal = buildAndValidateProposal(raw, d, allowedActions, callId);
       } catch (err) {
-        console.error(`[propose] falling back for dossier ${d.dossierId}: ${err.message}`);
+        log.warn(reqId, { evaluationId, dossierId: d.dossierId }, `falling back to safe default: ${err.message}`);
         finalProposal = fallbackProposal(d, callId);
       }
 
@@ -124,14 +138,17 @@ async function handlePropose(body) {
   if (!inserted) {
     // Lost a race with a concurrent identical request for this evaluationId.
     if (row && row.input_digest === dossiersDigest) {
+      log.warn(reqId, { evaluationId }, 'lost insert race, but digest matches winner -> 200 replay');
       return { httpStatus: 200, body: JSON.parse(row.response_json) };
     }
+    log.warn(reqId, { evaluationId }, 'lost insert race AND digest differs from winner -> 409');
     return {
       httpStatus: 409,
       body: errorBody(body, 'evaluationId already used with different dossier content'),
     };
   }
 
+  log.info(reqId, { evaluationId, proposals: proposals.length }, 'NEW_EVALUATION stored -> 200');
   return { httpStatus: 200, body: responseBody };
 }
 

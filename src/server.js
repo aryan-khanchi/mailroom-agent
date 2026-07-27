@@ -8,7 +8,9 @@ const express = require('express');
 const db = require('./db');
 const { handlePropose } = require('./propose');
 const { handleCommit } = require('./commit');
+const { newRequestId, makeLogger } = require('./logger');
 
+const log = makeLogger('server');
 const MAX_BODY_BYTES = 512 * 1024; // matches the 512 KiB response cap; also a sane request cap
 
 const app = express();
@@ -25,30 +27,42 @@ function withTimeout(promise, ms) {
 }
 
 app.post('/v1/mailroom/actions', async (req, res) => {
+  const reqId = newRequestId();
+  const startedAt = Date.now();
   const body = req.body;
   try {
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      log.warn(reqId, {}, 'invalid JSON body (not an object)');
       return res.status(400).json({ status: 'error', error: 'invalid JSON body' });
     }
 
+    log.info(reqId, { operation: body.operation, evaluationId: body.evaluationId }, 'received');
+
     let result;
     if (body.operation === 'propose') {
-      result = await withTimeout(handlePropose(body), 50_000);
+      result = await withTimeout(handlePropose(body, reqId), 50_000);
     } else if (body.operation === 'commit') {
-      result = await withTimeout(handleCommit(body), 50_000);
+      result = await withTimeout(handleCommit(body, reqId), 50_000);
     } else {
+      log.warn(reqId, { operation: body.operation }, 'unknown operation');
       return res.status(400).json({ status: 'error', error: 'operation must be "propose" or "commit"' });
     }
 
     const serialized = JSON.stringify(result.body);
     if (Buffer.byteLength(serialized, 'utf8') > MAX_BODY_BYTES) {
-      console.error('[server] response exceeds 512 KiB, this should not happen at exam scale');
+      log.error(reqId, {}, 'response exceeds 512 KiB, this should not happen at exam scale');
     }
+
+    log.info(
+      reqId,
+      { httpStatus: result.httpStatus, durationMs: Date.now() - startedAt },
+      'responding'
+    );
 
     res.setHeader('Content-Type', 'application/json');
     return res.status(result.httpStatus).send(serialized);
   } catch (err) {
-    console.error('[server] unhandled error:', err);
+    log.error(reqId, { durationMs: Date.now() - startedAt }, `unhandled error: ${err.stack || err}`);
     return res.status(500).json({ status: 'error', error: 'internal error' });
   }
 });

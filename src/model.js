@@ -1,5 +1,7 @@
 'use strict';
+const { makeLogger } = require('./logger');
 
+const log = makeLogger('model');
 const PROVIDER = (process.env.MODEL_PROVIDER || 'anthropic').toLowerCase();
 const CHUNK_SIZE = parseInt(process.env.MODEL_CHUNK_SIZE || '10', 10);
 const CALL_TIMEOUT_MS = parseInt(process.env.MODEL_TIMEOUT_MS || '20000', 10);
@@ -39,6 +41,14 @@ Arguments - accuracy is more important than filling every field:
   for a real fact. A referenceId is a specific order number, case number, or ticket
   number that appears in the dossier's own lines - if no such number appears, that is
   the "fact genuinely not present" case below, not a reason to fall back to dossierId.
+- For "recipient" (create_draft) and the email target (send_approved_notice): this
+  must be the specific person whose request this dossier is actually responding to -
+  the original requester/customer awaiting a reply. A dossier may also mention other
+  parties (a supplier, a partner, a colleague, someone CC'd, someone quoted) who are
+  relevant context but are NOT who the reply is addressed to. Before writing this
+  value, identify who asked the question or is owed the reply, and use only their
+  address - do not default to whichever email address happens to appear first or most
+  often in the text.
 - If a required fact genuinely is not present anywhere in the dossier, that is itself
   a signal you may have the wrong action - reconsider whether request_confirmation or
   no_action fits better before forcing a value that isn't there.
@@ -218,7 +228,7 @@ async function callGemini(userContent) {
  * obtained or parsed are simply absent from the map; the caller applies the
  * safe fallback for those. Never throws.
  */
-async function decideBatch(dossiers, allowedActions) {
+async function decideBatch(dossiers, allowedActions, reqId) {
   const results = new Map();
 
   if (PROVIDER === 'mock') {
@@ -238,13 +248,15 @@ async function decideBatch(dossiers, allowedActions) {
   }
 
   const chunks = chunkArray(dossiers, CHUNK_SIZE);
+  log.info(reqId, { provider: PROVIDER, dossiers: dossiers.length, chunks: chunks.length, chunkSize: CHUNK_SIZE }, 'starting model batch(es)');
 
   await Promise.all(
-    chunks.map(async (batch) => {
+    chunks.map(async (batch, i) => {
       const userContent = JSON.stringify({
         allowedActions,
         dossiers: batch.map(dossierForPrompt),
       });
+      const chunkStart = Date.now();
       try {
         let raw;
         if (PROVIDER === 'ollama') raw = await callOllama(userContent);
@@ -252,14 +264,31 @@ async function decideBatch(dossiers, allowedActions) {
         else if (PROVIDER === 'gemini') raw = await callGemini(userContent);
         else raw = await callAnthropic(userContent);
 
-        const arr = extractJsonArray(raw);
+        let arr;
+        try {
+          arr = extractJsonArray(raw);
+        } catch (parseErr) {
+          log.error(
+            reqId,
+            { chunk: i, batchSize: batch.length, durationMs: Date.now() - chunkStart },
+            `parse failed: ${parseErr.message} | raw (first 300 chars): ${String(raw).slice(0, 300)}`
+          );
+          return;
+        }
+        let matched = 0;
         for (const item of arr) {
           if (item && typeof item.dossierId === 'string') {
             results.set(item.dossierId, item);
+            matched++;
           }
         }
+        log.info(
+          reqId,
+          { chunk: i, batchSize: batch.length, matched, durationMs: Date.now() - chunkStart },
+          'chunk done'
+        );
       } catch (err) {
-        console.error('[model] batch failed:', err.message);
+        log.error(reqId, { chunk: i, batchSize: batch.length, durationMs: Date.now() - chunkStart }, `batch call failed: ${err.message}`);
         // Leave this batch's dossiers unset -> caller falls back safely.
       }
     })
