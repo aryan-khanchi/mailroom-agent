@@ -1,0 +1,8 @@
+node_modules/
+data/
+test/.tmp-test-data/
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
