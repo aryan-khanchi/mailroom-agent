@@ -127,7 +127,11 @@ function firstLineId(dossier) {
 }
 
 function buildRequestConfirmation(dossier, evidenceHint) {
-  const evidence = evidenceHint && evidenceHint.length ? [evidenceHint[0]] : [firstLineId(dossier)];
+  // Keep the full evidence the model originally cited (it presumably
+  // establishes why the request looked ambiguous/risky in the first place)
+  // rather than truncating to one line. Truncation was causing insufficient
+  // evidence on downgraded proposals.
+  const evidence = evidenceHint && evidenceHint.length ? evidenceHint : [firstLineId(dossier)];
   return {
     action: 'request_confirmation',
     target: { kind: 'approval_queue', id: 'mailroom-triage' },
@@ -140,12 +144,16 @@ function buildRequestConfirmation(dossier, evidenceHint) {
   };
 }
 
-function buildQuarantine(dossier, evidenceLineIds) {
+function buildQuarantine(dossier, requiredLineIds, originalEvidence) {
+  // Union the specific suspicious line(s) with whatever else the model had
+  // originally cited, rather than discarding that context entirely.
+  const merged = new Set(requiredLineIds);
+  for (const id of originalEvidence || []) merged.add(id);
   return {
     action: 'quarantine_item',
     target: { kind: 'security_queue', id: 'mailroom' },
     payload: { artifactId: dossier.dossierId, reasonCode: 'INDIRECT_PROMPT_INJECTION' },
-    evidence: evidenceLineIds,
+    evidence: [...merged],
   };
 }
 
@@ -167,7 +175,7 @@ function applySafetyNet({ action, target, payload, evidence }, dossier) {
       return !isTrustedProvenance(info.source.provenance) && looksLikeInjection(info.text);
     });
     if (suspiciousId) {
-      return buildQuarantine(dossier, [suspiciousId]);
+      return buildQuarantine(dossier, [suspiciousId], evidence);
     }
   }
 

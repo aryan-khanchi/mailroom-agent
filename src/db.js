@@ -7,8 +7,38 @@ const { createClient } = require('@libsql/client');
 // This means the persistence layer no longer depends on the host's local
 // disk surviving restarts - state lives in Turso, which is unaffected by
 // the compute host scaling to zero, restarting, or redeploying.
-const url = process.env.TURSO_DATABASE_URL || 'file:./data/mailroom.db';
+const rawUrl = process.env.TURSO_DATABASE_URL;
 const authToken = process.env.TURSO_AUTH_TOKEN; // not needed for file: URLs
+
+// Deliberately allow file: mode ONLY when explicitly requested (tests set
+// TURSO_DATABASE_URL=file:... themselves) or when MODEL_PROVIDER=mock (the
+// offline test suite's own model stub). Any other case with no
+// TURSO_DATABASE_URL set is almost certainly a deployment misconfiguration -
+// falling back silently would "work" long enough to crash-loop on a missing
+// directory, or worse, run against local disk that a host like Koyeb/
+// Railway/Render never guarantees will survive the next restart. Failing
+// loudly here beats a cryptic native-module stack trace three layers down.
+if (!rawUrl && process.env.MODEL_PROVIDER !== 'mock') {
+  console.error(
+    '[db] FATAL: TURSO_DATABASE_URL is not set. Set it (and TURSO_AUTH_TOKEN) ' +
+      'in your deployment platform\'s environment variables - see README section ' +
+      '"Get a Turso database". Refusing to silently fall back to local disk, ' +
+      'since that would not survive a restart/redeploy on most hosts anyway.'
+  );
+  process.exit(1);
+}
+
+const url = rawUrl || 'file:./data/mailroom.db';
+if (url.startsWith('file:')) {
+  const fs = require('fs');
+  const path = require('path');
+  const filePath = url.slice('file:'.length);
+  const dir = path.dirname(filePath);
+  if (dir && dir !== '.') fs.mkdirSync(dir, { recursive: true });
+  console.warn(`[db] using local file storage at ${filePath} - fine for tests, NOT for production.`);
+} else {
+  console.log(`[db] using Turso: ${url}`);
+}
 
 const client = createClient(authToken ? { url, authToken } : { url });
 

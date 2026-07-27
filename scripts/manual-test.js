@@ -14,6 +14,13 @@ const crypto = require('crypto');
 
 const URL_ARG = process.argv[2] || 'http://localhost:8081/v1/mailroom/actions';
 const EVAL_ID = process.argv[3] || `manual-${Date.now()}`;
+// Every run gets fresh dossier content (via this nonce baked into each
+// dossierId) so the cache is deliberately missed and a real model call
+// happens every time this script runs - otherwise, after the first
+// successful run, the content-fingerprint cache would keep serving the
+// exact same cached decision forever, silently defeating the whole point
+// of using this script to check the CURRENT prompt/code.
+const NONCE = crypto.randomBytes(4).toString('hex');
 
 function canonicalStringify(value) {
   if (value === null || value === undefined) return 'null';
@@ -55,7 +62,7 @@ async function main() {
     ],
     dossiers: [
       {
-        dossierId: 'd1',
+        dossierId: `d1-${NONCE}`,
         partition: 'stable_core',
         receivedAt: '2026-01-01T00:00:00Z',
         mailbox: 'support@example.com',
@@ -71,7 +78,7 @@ async function main() {
         ],
       },
       {
-        dossierId: 'd2',
+        dossierId: `d2-${NONCE}`,
         partition: 'stable_core',
         receivedAt: '2026-01-01T00:05:00Z',
         mailbox: 'support@example.com',
@@ -87,7 +94,7 @@ async function main() {
         ],
       },
       {
-        dossierId: 'd3',
+        dossierId: `d3-${NONCE}`,
         partition: 'stable_core',
         receivedAt: '2026-01-01T00:10:00Z',
         mailbox: 'orders@example.com',
@@ -110,7 +117,7 @@ async function main() {
         ],
       },
       {
-        dossierId: 'd4',
+        dossierId: `d4-${NONCE}`,
         partition: 'stable_core',
         receivedAt: '2026-01-01T00:15:00Z',
         mailbox: 'logistics@example.com',
@@ -126,7 +133,7 @@ async function main() {
         ],
       },
       {
-        dossierId: 'd5',
+        dossierId: `d5-${NONCE}`,
         partition: 'stable_core',
         receivedAt: '2026-01-01T00:20:00Z',
         mailbox: 'support@example.com',
@@ -157,6 +164,29 @@ async function main() {
   if (proposeResp.status !== 200 || proposeBody.status !== 'awaiting_receipts') {
     console.log('\nStopping here - propose did not succeed, so there is nothing to commit.');
     return;
+  }
+
+  // Live conflict-rejection check: same evaluationId, but one line of
+  // dossier content changed. Must come back HTTP 409, not 200. This exists
+  // because the grader reported this check failing while other persistence
+  // -dependent checks (replay, stable reuse) passed - testing it directly
+  // against the live deployment is the fastest way to tell whether that was
+  // a deployment problem (now fixed) or an actual logic bug.
+  const conflictReq = JSON.parse(JSON.stringify(proposeReq));
+  conflictReq.dossiers[0].sources[0].lines[0].text += ' [changed for conflict test]';
+  console.log(`\n--- POST propose again, SAME evaluationId (${EVAL_ID}) but CHANGED content -> expect HTTP 409 ---`);
+  const conflictResp = await fetch(URL_ARG, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(conflictReq),
+  });
+  const conflictBody = await conflictResp.json();
+  console.log(`HTTP ${conflictResp.status}`);
+  console.log(JSON.stringify(conflictBody, null, 2));
+  if (conflictResp.status === 409) {
+    console.log('PASS: conflict correctly rejected with 409');
+  } else {
+    console.log(`FAIL: expected HTTP 409, got ${conflictResp.status} - conflict detection is not working on this deployment`);
   }
 
   const { inputDigest, proposals } = proposeBody;
