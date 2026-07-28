@@ -165,14 +165,29 @@ function extractReferenceId(originalPayload) {
   return null;
 }
 
-function buildRequestConfirmation(dossier, evidenceHint, originalPayload) {
+// Mechanical last-resort: the local part of the mailbox address (e.g.
+// "billing@acme.example" -> "billing") is real dossier envelope data, not
+// an invented value, so it's a better fallback than a single global
+// constant even though it's cruder than a model-derived team.
+function teamFromMailbox(mailbox) {
+  if (typeof mailbox !== 'string' || !mailbox.includes('@')) return null;
+  const local = mailbox.split('@')[0].trim().toLowerCase();
+  return local.length > 0 ? local : null;
+}
+
+function resolveOwningTeam(dossier, suggestedTeam) {
+  if (typeof suggestedTeam === 'string' && suggestedTeam.trim().length > 0) {
+    return suggestedTeam.trim().toLowerCase();
+  }
+  return teamFromMailbox(dossier.mailbox) || 'mailroom-triage';
+}
+
+function buildRequestConfirmation(dossier, evidenceHint, originalPayload, suggestedTeam) {
   const evidence = evidenceHint && evidenceHint.length ? evidenceHint : [firstLineId(dossier)];
-  // target.id ("<owning team>") still has no reliable code-derivable value -
-  // this constant remains a known gap, see write-up.
   const referenceId = extractReferenceId(originalPayload) || dossier.mailbox || dossier.objective || 'unspecified';
   return {
     action: 'request_confirmation',
-    target: { kind: 'approval_queue', id: 'mailroom-triage' },
+    target: { kind: 'approval_queue', id: resolveOwningTeam(dossier, suggestedTeam) },
     payload: {
       claimedSender: dossier.mailbox || 'unknown',
       questionCode: 'VERIFY_REQUEST',
@@ -206,13 +221,13 @@ function buildQuarantine(dossier, requiredLineIds) {
 // even if the model is fooled by injected content into proposing an outbound
 // send or a record mutation, this downgrades it to a safe action unless the
 // cited evidence includes a trusted-provenance source.
-function applySafetyNet({ action, target, payload, evidence }, dossier) {
+function applySafetyNet({ action, target, payload, evidence, suggestedTeam }, dossier) {
   const lines = allLines(dossier);
 
   if (action === 'send_approved_notice' || action === 'update_internal_record') {
     const hasTrusted = evidence.some((id) => isTrustedProvenance(lines.get(id).source.provenance));
     if (!hasTrusted) {
-      return buildRequestConfirmation(dossier, evidence, payload);
+      return buildRequestConfirmation(dossier, evidence, payload, suggestedTeam);
     }
     const suspiciousId = evidence.find((id) => {
       const info = lines.get(id);
@@ -226,20 +241,98 @@ function applySafetyNet({ action, target, payload, evidence }, dossier) {
   return { action, target, payload, evidence };
 }
 
+// Fields that must always be verbatim identifiers copied from dossier text
+// (order/case numbers, emails, case ids). If the model's value can't be
+// found in ANY line of the dossier, that's a strong signal it was invented
+// rather than extracted - reject into the safe fallback rather than submit
+// a hallucinated argument with no real backing. update_internal_record and
+// send_approved_notice never reach here after a safety-net downgrade (their
+// action gets replaced with request_confirmation/quarantine_item first), so
+// checking their fields here only ever applies to genuinely-approved cases.
+const STRICT_VERBATIM_FIELDS = {
+  create_draft: ['payload.recipient', 'payload.referenceId'],
+  update_internal_record: ['target.id', 'payload.sourceEventId'],
+  send_approved_notice: ['target.id', 'payload.referenceId'],
+  request_confirmation: [],
+  no_action: ['payload.referenceId'],
+  quarantine_item: [],
+};
+
+// Fields that are often legitimately derived/paraphrased (statuses,
+// descriptions) rather than exact quotes - e.g. dossier text reading "still
+// running behind" might legitimately become status:"delayed". We still
+// auto-add a supporting line when we find an exact match (fixing missed
+// citations), but we don't reject just because no literal substring exists,
+// since a reasonable derivation is expected and allowed for these fields.
+const BEST_EFFORT_FIELDS = {
+  create_draft: ['payload.status'],
+  update_internal_record: ['payload.value'],
+  send_approved_notice: ['payload.status'],
+  request_confirmation: [],
+  no_action: [],
+  quarantine_item: [],
+};
+
+function getFieldValue(fieldPath, target, payload) {
+  if (fieldPath === 'target.id') return target ? target.id : null;
+  return payload ? payload[fieldPath.split('.')[1]] : null;
+}
+
+function findLinesContaining(dossier, value) {
+  if (typeof value !== 'string' || value.length === 0) return [];
+  const needle = value.toLowerCase();
+  const hits = [];
+  for (const s of dossier.sources) {
+    for (const l of s.lines) {
+      if (l.text.toLowerCase().includes(needle)) hits.push(l.lineId);
+    }
+  }
+  return hits;
+}
+
+// Mechanically closes the "cite all lines needed to establish the action
+// and arguments" gap: for every argument value that is supposed to trace
+// back to real dossier text, make sure a line proving it is actually in the
+// evidence array - adding it if the model forgot, rejecting the proposal if
+// the value cannot be found anywhere at all.
+function verifyAndAugmentEvidence(action, target, payload, evidence, dossier) {
+  const augmented = new Set(evidence);
+
+  for (const fieldPath of STRICT_VERBATIM_FIELDS[action] || []) {
+    const value = getFieldValue(fieldPath, target, payload);
+    const matches = findLinesContaining(dossier, value);
+    if (matches.length === 0) {
+      throw new Error(`no dossier line contains the value used for ${fieldPath}: "${value}"`);
+    }
+    if (!matches.some((id) => augmented.has(id))) augmented.add(matches[0]);
+  }
+
+  for (const fieldPath of BEST_EFFORT_FIELDS[action] || []) {
+    const value = getFieldValue(fieldPath, target, payload);
+    const matches = findLinesContaining(dossier, value);
+    if (matches.length > 0 && !matches.some((id) => augmented.has(id))) {
+      augmented.add(matches[0]);
+    }
+  }
+
+  return [...augmented];
+}
+
 // Validate a raw model decision against the frozen schemas + evidence rules,
 // then run it through the safety net. Throws on any schema violation so the
 // caller can fall back to a safe default instead of persisting garbage.
 function buildAndValidateProposal(raw, dossier, allowedActions, callId) {
   if (!raw) throw new Error('no model output for dossier');
-  const { action, target = null, payload, evidence } = raw;
+  const { action, target = null, payload, evidence, suggestedTeam } = raw;
   if (!KNOWN_ACTIONS.has(action) || !allowedActions.includes(action)) {
     throw new Error(`action not allowed: ${action}`);
   }
   validateShape(action, target ?? null, payload);
   validateEvidence(evidence, dossier);
 
-  const safe = applySafetyNet({ action, target: target ?? null, payload, evidence }, dossier);
+  const safe = applySafetyNet({ action, target: target ?? null, payload, evidence, suggestedTeam }, dossier);
   safe.target = normalizeTarget(safe.action, safe.target, dossier);
+  safe.evidence = verifyAndAugmentEvidence(safe.action, safe.target, safe.payload, safe.evidence, dossier);
   return { callId, ...safe };
 }
 
