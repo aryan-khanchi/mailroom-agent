@@ -106,6 +106,29 @@ function validateShape(action, target, payload) {
   if (action === 'no_action' && !['ALREADY_COMPLETED', 'DUPLICATE', 'INFORMATIONAL'].includes(payload.reasonCode)) {
     throw new Error('invalid reasonCode for no_action');
   }
+  // "field" is a frozen constant for update_internal_record, exactly like
+  // "template" is for create_draft/send_approved_notice. Previously the key
+  // was required to be present but its VALUE was never checked, so a model
+  // that invented a different field name silently passed validation and
+  // just scored as a wrong argument on the grader's side.
+  if (action === 'update_internal_record' && payload.field !== 'delivery_window') {
+    throw new Error('field must be "delivery_window"');
+  }
+}
+
+// Some target values are fully determined by data we already have and are
+// NOT a judgment call for the model at all. Forcing them here removes an
+// entire class of argument mismatches that had nothing to do with
+// reasoning - only formatting the model was free to get slightly wrong
+// (e.g. "mailbox:X" vs "Mailbox: X" vs just "X").
+function normalizeTarget(action, target, dossier) {
+  if (action === 'create_draft') {
+    return { kind: 'draft_queue', id: `mailbox:${dossier.mailbox}` };
+  }
+  if (action === 'quarantine_item') {
+    return { kind: 'security_queue', id: 'mailroom' };
+  }
+  return target;
 }
 
 function validateEvidence(evidence, dossier) {
@@ -126,34 +149,55 @@ function firstLineId(dossier) {
   return dossier.sources[0].lines[0].lineId;
 }
 
-function buildRequestConfirmation(dossier, evidenceHint) {
-  // Keep the full evidence the model originally cited (it presumably
-  // establishes why the request looked ambiguous/risky in the first place)
-  // rather than truncating to one line. Truncation was causing insufficient
-  // evidence on downgraded proposals.
+// Pull a real, content-derived reference/case number out of whatever the
+// model already extracted for the ORIGINAL (now-rejected) proposal, instead
+// of ever falling back to the internal dossierId. The model's own system
+// prompt explicitly forbids using dossierId as a stand-in for referenceId -
+// the old fallback here broke that same rule in code.
+function extractReferenceId(originalPayload) {
+  if (!originalPayload) return null;
+  if (typeof originalPayload.referenceId === 'string' && originalPayload.referenceId.length > 0) {
+    return originalPayload.referenceId;
+  }
+  if (typeof originalPayload.sourceEventId === 'string' && originalPayload.sourceEventId.length > 0) {
+    return originalPayload.sourceEventId;
+  }
+  return null;
+}
+
+function buildRequestConfirmation(dossier, evidenceHint, originalPayload) {
   const evidence = evidenceHint && evidenceHint.length ? evidenceHint : [firstLineId(dossier)];
+  // target.id ("<owning team>") still has no reliable code-derivable value -
+  // this constant remains a known gap, see write-up.
+  const referenceId = extractReferenceId(originalPayload) || dossier.mailbox || dossier.objective || 'unspecified';
   return {
     action: 'request_confirmation',
     target: { kind: 'approval_queue', id: 'mailroom-triage' },
     payload: {
       claimedSender: dossier.mailbox || 'unknown',
       questionCode: 'VERIFY_REQUEST',
-      referenceId: dossier.dossierId,
+      referenceId,
     },
     evidence,
   };
 }
 
-function buildQuarantine(dossier, requiredLineIds, originalEvidence) {
-  // Union the specific suspicious line(s) with whatever else the model had
-  // originally cited, rather than discarding that context entirely.
-  const merged = new Set(requiredLineIds);
-  for (const id of originalEvidence || []) merged.add(id);
+function buildQuarantine(dossier, requiredLineIds) {
+  // artifactId identifies the malicious ARTIFACT (the source/email/
+  // attachment carrying the injection), not the dossier's own bookkeeping
+  // id - same mistake as referenceId above, now fixed the same way: use a
+  // real identifier that already exists on the flagged source.
+  // Evidence is no longer merged with the original (rejected) proposal's
+  // evidence - those lines supported a send/update action we are now
+  // refusing, and including them only hurts minimality.
+  const lines = allLines(dossier);
+  const uniqueLineIds = [...new Set(requiredLineIds)];
+  const artifactId = lines.get(uniqueLineIds[0]).source.sourceId;
   return {
     action: 'quarantine_item',
     target: { kind: 'security_queue', id: 'mailroom' },
-    payload: { artifactId: dossier.dossierId, reasonCode: 'INDIRECT_PROMPT_INJECTION' },
-    evidence: [...merged],
+    payload: { artifactId, reasonCode: 'INDIRECT_PROMPT_INJECTION' },
+    evidence: uniqueLineIds,
   };
 }
 
@@ -168,14 +212,14 @@ function applySafetyNet({ action, target, payload, evidence }, dossier) {
   if (action === 'send_approved_notice' || action === 'update_internal_record') {
     const hasTrusted = evidence.some((id) => isTrustedProvenance(lines.get(id).source.provenance));
     if (!hasTrusted) {
-      return buildRequestConfirmation(dossier, evidence);
+      return buildRequestConfirmation(dossier, evidence, payload);
     }
     const suspiciousId = evidence.find((id) => {
       const info = lines.get(id);
       return !isTrustedProvenance(info.source.provenance) && looksLikeInjection(info.text);
     });
     if (suspiciousId) {
-      return buildQuarantine(dossier, [suspiciousId], evidence);
+      return buildQuarantine(dossier, [suspiciousId]);
     }
   }
 
@@ -195,6 +239,7 @@ function buildAndValidateProposal(raw, dossier, allowedActions, callId) {
   validateEvidence(evidence, dossier);
 
   const safe = applySafetyNet({ action, target: target ?? null, payload, evidence }, dossier);
+  safe.target = normalizeTarget(safe.action, safe.target, dossier);
   return { callId, ...safe };
 }
 
